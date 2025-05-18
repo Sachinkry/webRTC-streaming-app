@@ -1,0 +1,11 @@
+dist
+.next
+out
+
+# Dependencies
+node_modules
+
+# Lockfiles
+pnpm-lock.yaml
+package-lock.json
+yarn.lock
