@@ -3,300 +3,379 @@ import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
 import { Server as SocketIOServer, Socket } from 'socket.io';
 import http from 'http';
-import * as mediasoup from 'mediasoup'; // Updated import
-import { types as mediasoupTypes } from 'mediasoup'; // Keep this for types
+import * as mediasoup from 'mediasoup';
+import { types as mediasoupTypes } from 'mediasoup';
 import { config as mediasoupAppConfig } from './mediasoup.config';
 import { logger } from 'hono/logger';
 
-// --- Mediasoup Globals ---
-let worker: mediasoupTypes.Worker;
-let router: mediasoupTypes.Router;
-const transports = new Map<string, mediasoupTypes.WebRtcTransport>();
-const producers = new Map<string, mediasoupTypes.Producer>();
-const consumers = new Map<string, mediasoupTypes.Consumer>();
-const peerState = new Map<string, { producers: string[], consumers: string[] }>();
+// --- Mediasoup Globals encapsulated in a class ---
+class MediasoupController {
+    private worker!: mediasoupTypes.Worker;
+    private router!: mediasoupTypes.Router;
+    private transports = new Map<string, mediasoupTypes.WebRtcTransport>();
+    private producers = new Map<string, mediasoupTypes.Producer>();
+    private consumers = new Map<string, mediasoupTypes.Consumer>();
+    private peerState = new Map<string, { producers: string[], consumers: string[] }>();
 
-async function startMediasoup() {
-  console.log('Starting Mediasoup worker...');
-  if (!mediasoup || typeof mediasoup.createWorker !== 'function') {
-    console.error('Mediasoup or mediasoup.createWorker is not available. Check import.');
-    throw new Error('Mediasoup not initialized correctly.');
-  }
-  worker = await mediasoup.createWorker({ // This should now work
-    logLevel: mediasoupAppConfig.mediasoup.workerSettings.logLevel,
-    logTags: mediasoupAppConfig.mediasoup.workerSettings.logTags,
-    rtcMinPort: mediasoupAppConfig.mediasoup.workerSettings.rtcMinPort,
-    rtcMaxPort: mediasoupAppConfig.mediasoup.workerSettings.rtcMaxPort,
-  });
+    constructor() {}
 
-  worker.on('died', (error) => {
-    console.error('Mediasoup worker has died:', error);
-    setTimeout(() => process.exit(1), 2000);
-  });
-  console.log(`Mediasoup worker started [pid:${worker.pid}]`);
+    public async startMediasoup() {
+        console.log('Starting Mediasoup worker...');
+        if (!mediasoup || typeof mediasoup.createWorker !== 'function') {
+            console.error('Mediasoup or mediasoup.createWorker is not available. Check import.');
+            throw new Error('Mediasoup not initialized correctly.');
+        }
+        this.worker = await mediasoup.createWorker({
+            logLevel: mediasoupAppConfig.mediasoup.workerSettings.logLevel,
+            logTags: mediasoupAppConfig.mediasoup.workerSettings.logTags,
+            rtcMinPort: mediasoupAppConfig.mediasoup.workerSettings.rtcMinPort,
+            rtcMaxPort: mediasoupAppConfig.mediasoup.workerSettings.rtcMaxPort,
+        });
 
-  router = await worker.createRouter({ mediaCodecs: mediasoupAppConfig.mediasoup.router.mediaCodecs });
-  console.log(`Mediasoup router created [id:${router.id}]`);
+        this.worker.on('died', (error) => {
+            console.error('Mediasoup worker has died:', error);
+            setTimeout(() => process.exit(1), 2000);
+        });
+        console.log(`Mediasoup worker started [pid:${this.worker.pid}]`);
+
+        this.router = await this.worker.createRouter({ mediaCodecs: mediasoupAppConfig.mediasoup.router.mediaCodecs });
+        console.log(`Mediasoup router created [id:${this.router.id}]`);
+    }
+
+    public getRouterRtpCapabilities(): mediasoupTypes.RtpCapabilities | null {
+        return this.router ? this.router.rtpCapabilities : null;
+    }
+
+    public async createWebRtcTransport(socketId: string, sender: boolean): Promise<any> {
+        if (!this.router) {
+            throw new Error('Router not initialized');
+        }
+        // Ensure listenIps is mutable for Mediasoup
+        const listenIps = mediasoupAppConfig.mediasoup.webRtcTransport.listenIps.map(ip => ({ ...ip }));
+
+        const transport = await this.router.createWebRtcTransport({
+            listenIps: listenIps,
+            enableUdp: mediasoupAppConfig.mediasoup.webRtcTransport.enableUdp,
+            enableTcp: mediasoupAppConfig.mediasoup.webRtcTransport.enableTcp,
+            preferUdp: mediasoupAppConfig.mediasoup.webRtcTransport.preferUdp,
+            initialAvailableOutgoingBitrate: mediasoupAppConfig.mediasoup.webRtcTransport.initialAvailableOutgoingBitrate,
+            appData: { peerId: socketId, clientIsSender: sender },
+        });
+        this.transports.set(transport.id, transport);
+        console.log(`[${socketId}] Transport created: ${transport.id}`);
+
+        transport.on('dtlsstatechange', (dtlsState) => {
+            if (dtlsState === 'closed') {
+                console.log(`[${socketId}] Transport ${transport.id} DTLS state closed`);
+                transport.close();
+                this.transports.delete(transport.id);
+            }
+        });
+
+        return {
+            id: transport.id,
+            iceParameters: transport.iceParameters,
+            iceCandidates: transport.iceCandidates,
+            dtlsParameters: transport.dtlsParameters,
+            sctpParameters: transport.sctpParameters,
+        };
+    }
+
+    public async connectWebRtcTransport(socketId: string, transportId: string, dtlsParameters: mediasoupTypes.DtlsParameters) {
+        const transport = this.transports.get(transportId);
+        if (!transport) {
+            throw new Error(`Transport with id "${transportId}" not found`);
+        }
+        await transport.connect({ dtlsParameters });
+        console.log(`[${socketId}] Transport ${transportId} connected`);
+    }
+
+    public async produce(socketId: string, transportId: string, kind: mediasoupTypes.MediaKind, rtpParameters: mediasoupTypes.RtpParameters, appData: any): Promise<mediasoupTypes.Producer> {
+        const transport = this.transports.get(transportId);
+        if (!transport) {
+            throw new Error(`Transport with id "${transportId}" not found`);
+        }
+        const producer = await transport.produce({
+            kind,
+            rtpParameters,
+            appData: { ...appData, peerId: socketId, transportId },
+        });
+        this.producers.set(producer.id, producer);
+        const peerStateEntry = this.peerState.get(socketId);
+        if (peerStateEntry) {
+            peerStateEntry.producers.push(producer.id);
+        } else {
+            this.peerState.set(socketId, { producers: [producer.id], consumers: [] });
+        }
+        console.log(`[${socketId}] Producer created: ${producer.id} (kind: ${kind})`);
+
+        producer.on('transportclose', () => {
+            console.log(`[${socketId}] Producer ${producer.id} transport closed`);
+            producer.close();
+            this.producers.delete(producer.id);
+            const peerProds = this.peerState.get(socketId)?.producers;
+            if (peerProds) this.peerState.get(socketId)!.producers = peerProds.filter(pId => pId !== producer.id);
+        });
+        return producer;
+    }
+
+    public async consume(socketId: string, producerId: string, rtpCapabilities: mediasoupTypes.RtpCapabilities, transportId: string): Promise<mediasoupTypes.Consumer> {
+        if (!this.router) {
+            throw new Error('Router not initialized');
+        }
+        const producerToConsume = this.producers.get(producerId);
+        if (!producerToConsume) {
+            throw new Error(`Producer with id "${producerId}" not found`);
+        }
+        if (!this.router.canConsume({ producerId, rtpCapabilities })) {
+            throw new Error('Cannot consume this producer');
+        }
+        const transport = this.transports.get(transportId);
+        if (!transport) {
+            throw new Error(`Receiving transport with id "${transportId}" not found.`);
+        }
+
+        const consumer = await transport.consume({
+            producerId,
+            rtpCapabilities,
+            paused: true,
+            appData: { peerId: socketId, producerId }
+        });
+        this.consumers.set(consumer.id, consumer);
+        const peerStateEntry = this.peerState.get(socketId);
+        if (peerStateEntry) {
+            peerStateEntry.consumers.push(consumer.id);
+        } else {
+            this.peerState.set(socketId, { producers: [], consumers: [consumer.id] });
+        }
+
+        consumer.on('transportclose', () => {
+            console.log(`[${socketId}] Consumer ${consumer.id} transport closed`);
+            consumer.close();
+            this.consumers.delete(consumer.id);
+            const peerCons = this.peerState.get(socketId)?.consumers;
+            if (peerCons) this.peerState.get(socketId)!.consumers = peerCons.filter(cId => cId !== consumer.id);
+        });
+        consumer.on('producerclose', () => {
+            console.log(`[${socketId}] Consumer ${consumer.id} producer closed`);
+            consumer.close();
+            this.consumers.delete(consumer.id);
+            const peerCons = this.peerState.get(socketId)?.consumers;
+            if (peerCons) this.peerState.get(socketId)!.consumers = peerCons.filter(cId => cId !== consumer.id);
+        });
+
+        console.log(`[${socketId}] Consumer created: ${consumer.id} for producer ${producerId}`);
+        return consumer;
+    }
+
+    public async resumeConsumer(socketId: string, consumerId: string) {
+        const consumer = this.consumers.get(consumerId);
+        if (!consumer) {
+            throw new Error(`Consumer with id "${consumerId}" not found`);
+        }
+        await consumer.resume();
+        console.log(`[${socketId}] Consumer ${consumerId} resumed`);
+    }
+
+    public getExistingProducers(currentSocketId: string) {
+        const existingProducersList: { peerId: string; producerId: string; kind: mediasoupTypes.MediaKind; }[] = [];
+        for (const producer of this.producers.values()) {
+            if (producer.appData.peerId !== currentSocketId) {
+                existingProducersList.push({
+                    peerId: producer.appData.peerId as string,
+                    producerId: producer.id,
+                    kind: producer.kind,
+                });
+            }
+        }
+        return existingProducersList;
+    }
+
+    public cleanupPeer(socketId: string) {
+        const state = this.peerState.get(socketId);
+        if (state) {
+            state.producers.forEach(producerId => {
+                this.producers.get(producerId)?.close();
+                this.producers.delete(producerId);
+            });
+            state.consumers.forEach(consumerId => {
+                this.consumers.get(consumerId)?.close();
+                this.consumers.delete(consumerId);
+            });
+        }
+        this.peerState.delete(socketId);
+    }
 }
 
-// --- Hono App ---
-const honoApp = new Hono();
-honoApp.use('*', logger());
-honoApp.get('/', (c) => c.json({ message: 'Hono signaling server running!' }));
+// --- Socket.IO Signaling Handler Class ---
+class SocketHandler {
+    private io: SocketIOServer;
+    private mediasoupController: MediasoupController;
 
-// --- HTTP Server for Hono and Socket.IO ---
-const httpServer = http.createServer();
-
-// --- Socket.IO Signaling ---
-const io = new SocketIOServer(httpServer, {
-  cors: { origin: "*", methods: ["GET", "POST"] }
-});
-
-io.on('connection', (socket: Socket) => {
-  console.log(`Socket connected: ${socket.id}`);
-  peerState.set(socket.id, { producers: [], consumers: [] });
-
-  socket.on('disconnect', () => {
-    console.log(`Socket disconnected: ${socket.id}`);
-    const state = peerState.get(socket.id);
-    if (state) {
-      state.producers.forEach(producerId => {
-        producers.get(producerId)?.close();
-        producers.delete(producerId);
-      });
-      state.consumers.forEach(consumerId => {
-        consumers.get(consumerId)?.close();
-        consumers.delete(consumerId);
-      });
-    }
-    peerState.delete(socket.id);
-    socket.broadcast.emit('peer-disconnected', { peerId: socket.id });
-  });
-
-  socket.on('getRouterRtpCapabilities', (callback) => {
-    if (!router) {
-        console.error(`[${socket.id}] getRouterRtpCapabilities: Router not initialized`);
-        return callback({ error: 'Router not initialized' });
-    }
-    console.log(`[${socket.id}] getRouterRtpCapabilities`);
-    callback(router.rtpCapabilities);
-  });
-
-  socket.on('createWebRtcTransport', async ({ sender }: { sender: boolean }, callback) => {
-    console.log(`[${socket.id}] createWebRtcTransport (sender: ${sender})`);
-    if (!router) {
-        console.error(`[${socket.id}] createWebRtcTransport: Router not initialized`);
-        return callback({ error: 'Router not initialized' });
-    }
-    try {
-      // Ensure listenIps is mutable for Mediasoup
-      const listenIps = mediasoupAppConfig.mediasoup.webRtcTransport.listenIps.map(ip => ({ ...ip }));
-      
-      const transport = await router.createWebRtcTransport({
-        listenIps: listenIps,
-        enableUdp: mediasoupAppConfig.mediasoup.webRtcTransport.enableUdp,
-        enableTcp: mediasoupAppConfig.mediasoup.webRtcTransport.enableTcp,
-        preferUdp: mediasoupAppConfig.mediasoup.webRtcTransport.preferUdp,
-        initialAvailableOutgoingBitrate: mediasoupAppConfig.mediasoup.webRtcTransport.initialAvailableOutgoingBitrate,
-        appData: { peerId: socket.id, clientIsSender: sender },
-      });
-      transports.set(transport.id, transport);
-      console.log(`[${socket.id}] Transport created: ${transport.id}`);
-
-      transport.on('dtlsstatechange', (dtlsState) => {
-        if (dtlsState === 'closed') {
-          console.log(`[${socket.id}] Transport ${transport.id} DTLS state closed`);
-          transport.close();
-          transports.delete(transport.id);
-        }
-      });
-
-      callback({
-        id: transport.id,
-        iceParameters: transport.iceParameters,
-        iceCandidates: transport.iceCandidates,
-        dtlsParameters: transport.dtlsParameters,
-        sctpParameters: transport.sctpParameters,
-      });
-    } catch (error) {
-      console.error(`[${socket.id}] Error creating transport:`, error);
-      callback({ error: (error as Error).message });
-    }
-  });
-
-  socket.on('connectWebRtcTransport', async ({ transportId, dtlsParameters }, callback) => {
-    console.log(`[${socket.id}] connectWebRtcTransport (transportId: ${transportId})`);
-    const transport = transports.get(transportId);
-    if (!transport) {
-      return callback({ error: `Transport with id "${transportId}" not found` });
-    }
-    try {
-      await transport.connect({ dtlsParameters });
-      console.log(`[${socket.id}] Transport ${transportId} connected`);
-      callback({});
-    } catch (error) {
-      console.error(`[${socket.id}] Error connecting transport ${transportId}:`, error);
-      callback({ error: (error as Error).message });
-    }
-  });
-
-  socket.on('produce', async ({ transportId, kind, rtpParameters, appData }, callback) => {
-    console.log(`[${socket.id}] produce (transportId: ${transportId}, kind: ${kind})`);
-    const transport = transports.get(transportId);
-    if (!transport) {
-      return callback({ error: `Transport with id "${transportId}" not found` });
-    }
-    try {
-      const producer = await transport.produce({
-        kind,
-        rtpParameters,
-        appData: { ...appData, peerId: socket.id, transportId },
-      });
-      producers.set(producer.id, producer);
-      peerState.get(socket.id)?.producers.push(producer.id);
-      console.log(`[${socket.id}] Producer created: ${producer.id} (kind: ${kind})`);
-  
-      producer.on('transportclose', () => {
-        console.log(`[${socket.id}] Producer ${producer.id} transport closed`);
-        producer.close();
-        producers.delete(producer.id);
-        const peerProds = peerState.get(socket.id)?.producers;
-        if (peerProds) peerState.get(socket.id)!.producers = peerProds.filter(pId => pId !== producer.id);
-      });
-  
-      socket.broadcast.emit('new-producer', {
-        peerId: socket.id,
-        producerId: producer.id,
-        kind: producer.kind,
-      });
-      callback({ id: producer.id });
-    } catch (error) {
-      console.error(`[${socket.id}] Error producing:`, error);
-      callback({ error: (error as Error).message });
-    }
-  });
-
-  socket.on('consume', async ({ producerId, rtpCapabilities, transportId }, callback) => {
-    console.log(`[${socket.id}] consume (producerId: ${producerId}, transportId: ${transportId})`);
-    if (!router) {
-        console.error(`[${socket.id}] consume: Router not initialized`);
-        return callback({ error: 'Router not initialized' });
-    }
-    const producerToConsume = producers.get(producerId);
-    if (!producerToConsume) {
-      return callback({ error: `Producer with id "${producerId}" not found` });
-    }
-    if (!router.canConsume({ producerId, rtpCapabilities })) {
-      return callback({ error: 'Cannot consume this producer' });
-    }
-    const transport = transports.get(transportId);
-    if (!transport) {
-      return callback({ error: `Receiving transport with id "${transportId}" not found.` });
+    constructor(io: SocketIOServer, mediasoupController: MediasoupController) {
+        this.io = io;
+        this.mediasoupController = mediasoupController;
+        this.setupSocketEvents();
     }
 
-    try {
-      const consumer = await transport.consume({
-        producerId,
-        rtpCapabilities,
-        paused: true,
-        appData: { peerId: socket.id, producerId }
-      });
-      consumers.set(consumer.id, consumer);
-      peerState.get(socket.id)?.consumers.push(consumer.id);
+    private setupSocketEvents() {
+        this.io.on('connection', (socket: Socket) => {
+            console.log(`Socket connected: ${socket.id}`);
+            // peerState initialization is now done in MediasoupController when a producer/consumer is added
 
-      consumer.on('transportclose', () => {
-        console.log(`[${socket.id}] Consumer ${consumer.id} transport closed`);
-        // Proper cleanup
-        consumer.close();
-        consumers.delete(consumer.id);
-        const peerCons = peerState.get(socket.id)?.consumers;
-        if (peerCons) peerState.get(socket.id)!.consumers = peerCons.filter(cId => cId !== consumer.id);
-      });
-      consumer.on('producerclose', () => {
-        console.log(`[${socket.id}] Consumer ${consumer.id} producer closed`);
-        socket.emit('consumer-closed', { consumerId: consumer.id, remotePeerId: producerToConsume.appData.peerId });
-        // Proper cleanup
-        consumer.close();
-        consumers.delete(consumer.id);
-        const peerCons = peerState.get(socket.id)?.consumers;
-        if (peerCons) peerState.get(socket.id)!.consumers = peerCons.filter(cId => cId !== consumer.id);
-      });
+            socket.on('disconnect', () => {
+                console.log(`Socket disconnected: ${socket.id}`);
+                this.mediasoupController.cleanupPeer(socket.id);
+                socket.broadcast.emit('peer-disconnected', { peerId: socket.id });
+            });
 
-      console.log(`[${socket.id}] Consumer created: ${consumer.id} for producer ${producerId}`);
-      callback({
-        id: consumer.id,
-        producerId: consumer.producerId,
-        kind: consumer.kind,
-        rtpParameters: consumer.rtpParameters,
-      });
-    } catch (error) {
-      console.error(`[${socket.id}] Error consuming:`, error);
-      callback({ error: (error as Error).message });
-    }
-  });
+            socket.on('getRouterRtpCapabilities', (callback) => {
+                console.log(`[${socket.id}] getRouterRtpCapabilities`);
+                const rtpCapabilities = this.mediasoupController.getRouterRtpCapabilities();
+                if (!rtpCapabilities) {
+                    return callback({ error: 'Router not initialized' });
+                }
+                callback(rtpCapabilities);
+            });
 
-  socket.on('resume-consumer', async ({ consumerId }, callback) => {
-    console.log(`[${socket.id}] resume-consumer (consumerId: ${consumerId})`);
-    const consumer = consumers.get(consumerId);
-    if (!consumer) {
-      return callback({ error: `Consumer with id "${consumerId}" not found` });
-    }
-    try {
-      await consumer.resume();
-      console.log(`[${socket.id}] Consumer ${consumerId} resumed`);
-      callback({});
-    } catch (error) {
-      console.error(`[${socket.id}] Error resuming consumer ${consumerId}:`, error);
-      callback({ error: (error as Error).message });
-    }
-  });
+            socket.on('createWebRtcTransport', async ({ sender }: { sender: boolean }, callback) => {
+                console.log(`[${socket.id}] createWebRtcTransport (sender: ${sender})`);
+                try {
+                    const transportInfo = await this.mediasoupController.createWebRtcTransport(socket.id, sender);
+                    callback(transportInfo);
+                } catch (error) {
+                    console.error(`[${socket.id}] Error creating transport:`, error);
+                    callback({ error: (error as Error).message });
+                }
+            });
 
-  const existingProducersList = [];
-  for (const producer of producers.values()) {
-    if (producer.appData.peerId !== socket.id) {
-        existingProducersList.push({
-            peerId: producer.appData.peerId,
-            producerId: producer.id,
-            kind: producer.kind,
+            socket.on('connectWebRtcTransport', async ({ transportId, dtlsParameters }, callback) => {
+                console.log(`[${socket.id}] connectWebRtcTransport (transportId: ${transportId})`);
+                try {
+                    await this.mediasoupController.connectWebRtcTransport(socket.id, transportId, dtlsParameters);
+                    callback({});
+                } catch (error) {
+                    console.error(`[${socket.id}] Error connecting transport ${transportId}:`, error);
+                    callback({ error: (error as Error).message });
+                }
+            });
+
+            socket.on('produce', async ({ transportId, kind, rtpParameters, appData }, callback) => {
+                console.log(`[${socket.id}] produce (transportId: ${transportId}, kind: ${kind})`);
+                try {
+                    const producer = await this.mediasoupController.produce(socket.id, transportId, kind, rtpParameters, appData);
+                    socket.broadcast.emit('new-producer', {
+                        peerId: socket.id,
+                        producerId: producer.id,
+                        kind: producer.kind,
+                    });
+                    callback({ id: producer.id });
+                } catch (error) {
+                    console.error(`[${socket.id}] Error producing:`, error);
+                    callback({ error: (error as Error).message });
+                }
+            });
+
+            socket.on('consume', async ({ producerId, rtpCapabilities, transportId }, callback) => {
+                console.log(`[${socket.id}] consume (producerId: ${producerId}, transportId: ${transportId})`);
+                try {
+                    const consumer = await this.mediasoupController.consume(socket.id, producerId, rtpCapabilities, transportId);
+                    // Add producerClose listener here as it needs to emit to the specific socket
+                    consumer.on('producerclose', () => {
+                        console.log(`[${socket.id}] Consumer ${consumer.id} producer closed`);
+                        socket.emit('consumer-closed', { consumerId: consumer.id, remotePeerId: consumer.appData.producerId }); // Assuming producerId is stored in appData
+                    });
+                    callback({
+                        id: consumer.id,
+                        producerId: consumer.producerId,
+                        kind: consumer.kind,
+                        rtpParameters: consumer.rtpParameters,
+                    });
+                } catch (error) {
+                    console.error(`[${socket.id}] Error consuming:`, error);
+                    callback({ error: (error as Error).message });
+                }
+            });
+
+            socket.on('resume-consumer', async ({ consumerId }, callback) => {
+                console.log(`[${socket.id}] resume-consumer (consumerId: ${consumerId})`);
+                try {
+                    await this.mediasoupController.resumeConsumer(socket.id, consumerId);
+                    callback({});
+                } catch (error) {
+                    console.error(`[${socket.id}] Error resuming consumer ${consumerId}:`, error);
+                    callback({ error: (error as Error).message });
+                }
+            });
+
+            const existingProducersList = this.mediasoupController.getExistingProducers(socket.id);
+            if (existingProducersList.length > 0) {
+                socket.emit('existing-producers', existingProducersList);
+            }
         });
     }
-  }
-  if (existingProducersList.length > 0) {
-    socket.emit('existing-producers', existingProducersList);
-  }
-});
+}
+
+// --- Main Signaling Server Class ---
+class SignalingServer {
+    private honoApp: Hono;
+    private httpServer: http.Server;
+    private io: SocketIOServer;
+    private mediasoupController: MediasoupController;
+    private socketHandler: SocketHandler;
+    private port: number;
+
+    constructor() {
+        this.honoApp = new Hono();
+        this.httpServer = http.createServer();
+        this.io = new SocketIOServer(this.httpServer, {
+            cors: { origin: "*", methods: ["GET", "POST"] }
+        });
+        this.mediasoupController = new MediasoupController();
+        this.socketHandler = new SocketHandler(this.io, this.mediasoupController);
+        this.port = parseInt(process.env.BACKEND_PORT || '3001');
+
+        this.setupHono();
+    }
+
+    private setupHono() {
+        this.honoApp.use('*', logger());
+        this.honoApp.get('/', (c) => c.json({ message: 'Hono signaling server running!' }));
+    }
+
+    public async start() {
+        await this.mediasoupController.startMediasoup();
+
+        serve({
+            fetch: this.honoApp.fetch,
+            port: this.port,
+            createServer: () => this.httpServer // Use createServer to pass the existing http.Server
+        });
+
+        // Ensure the HTTP server is listening
+        if (!this.httpServer.listening) {
+            this.httpServer.listen(this.port, () => {
+                console.log(`Backend server with Hono & Socket.IO is running on http://localhost:${this.port}`);
+                const mediasoupListenIpInfo = mediasoupAppConfig.mediasoup.webRtcTransport.listenIps[0];
+                console.log(`Mediasoup listening on IP: ${mediasoupListenIpInfo.ip} announced as ${mediasoupListenIpInfo.announcedIp || 'auto-detected'}`);
+                console.log(`Mediasoup RTC port range: ${mediasoupAppConfig.mediasoup.workerSettings.rtcMinPort}-${mediasoupAppConfig.mediasoup.workerSettings.rtcMaxPort}`);
+            });
+        } else {
+            console.log(`Backend server with Hono & Socket.IO is running on http://localhost:${this.port}`);
+            const mediasoupListenIpInfo = mediasoupAppConfig.mediasoup.webRtcTransport.listenIps[0];
+            console.log(`Mediasoup listening on IP: ${mediasoupListenIpInfo.ip} announced as ${mediasoupListenIpInfo.announcedIp || 'auto-detected'}`);
+            console.log(`Mediasoup RTC port range: ${mediasoupAppConfig.mediasoup.workerSettings.rtcMinPort}-${mediasoupAppConfig.mediasoup.workerSettings.rtcMaxPort}`);
+        }
+    }
+}
 
 // --- Start Server ---
-const port = parseInt(process.env.BACKEND_PORT || '3001');
-
 async function run() {
-  await startMediasoup();
-
-  serve({
-    fetch: honoApp.fetch,
-    port: port,
-    createServer: () => httpServer // Use createServer to pass the existing http.Server
-  });
-  
-  // The 'serve' function with 'createServer' should handle listening.
-  // If not, the explicit httpServer.listen might be needed, but typically createServer implies management.
-  // For robustness, we ensure it's listening.
-  if (!httpServer.listening) {
-    httpServer.listen(port, () => {
-        console.log(`Backend server with Hono & Socket.IO is running on http://localhost:${port}`);
-        const mediasoupListenIpInfo = mediasoupAppConfig.mediasoup.webRtcTransport.listenIps[0];
-        console.log(`Mediasoup listening on IP: ${mediasoupListenIpInfo.ip} announced as ${mediasoupListenIpInfo.announcedIp || 'auto-detected'}`);
-        console.log(`Mediasoup RTC port range: ${mediasoupAppConfig.mediasoup.workerSettings.rtcMinPort}-${mediasoupAppConfig.mediasoup.workerSettings.rtcMaxPort}`);
-    });
-  } else { // If `serve` already started listening
-    console.log(`Backend server with Hono & Socket.IO is running on http://localhost:${port}`);
-    const mediasoupListenIpInfo = mediasoupAppConfig.mediasoup.webRtcTransport.listenIps[0];
-    console.log(`Mediasoup listening on IP: ${mediasoupListenIpInfo.ip} announced as ${mediasoupListenIpInfo.announcedIp || 'auto-detected'}`);
-    console.log(`Mediasoup RTC port range: ${mediasoupAppConfig.mediasoup.workerSettings.rtcMinPort}-${mediasoupAppConfig.mediasoup.workerSettings.rtcMaxPort}`);
-  }
+    const server = new SignalingServer();
+    await server.start();
 }
 
 run().catch(error => {
-  console.error('Failed to start the server:', error);
-  process.exit(1);
+    console.error('Failed to start the server:', error);
+    process.exit(1);
 });
