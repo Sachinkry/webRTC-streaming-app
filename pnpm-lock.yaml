@@ -1,0 +1,34 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      hls.js:
+        specifier: ^1.6.2
+        version: 1.6.2
+    devDependencies:
+      '@types/hls.js':
+        specifier: ^1.0.0
+        version: 1.0.0
+
+packages:
+
+  '@types/hls.js@1.0.0':
+    resolution: {integrity: sha512-EGY2QJefX+Z9XH4PAxI7RFoNqBlQEk16UpYR3kbr82CIgMX5SlMe0PjFdFV0JytRhyVPQCiwSyONuI6S1KdSag==}
+    deprecated: This is a stub types definition. hls.js provides its own type definitions, so you do not need this installed.
+
+  hls.js@1.6.2:
+    resolution: {integrity: sha512-rx+pETSCJEDThm/JCm8CuadcAC410cVjb1XVXFNDKFuylaayHk1+tFxhkjvnMDAfqsJHxZXDAJ3Uc2d5xQyWlQ==}
+
+snapshots:
+
+  '@types/hls.js@1.0.0':
+    dependencies:
+      hls.js: 1.6.2
+
+  hls.js@1.6.2: {}

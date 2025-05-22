@@ -9,5 +9,11 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "packageManager": "pnpm@10.11.0"
+  "packageManager": "pnpm@10.11.0",
+  "devDependencies": {
+    "@types/hls.js": "^1.0.0"
+  },
+  "dependencies": {
+    "hls.js": "^1.6.2"
+  }
 }

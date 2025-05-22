@@ -319,98 +319,125 @@ export default function StreamPage() {
   
 
   const consumeRemoteProducer = async (producerId: string, peerId: string) => {
-    // This check should now pass because the calling useEffect waits for these.
-    // deviceRef.current is used here directly as it's set before mediasoupDevice state might reflect.
-    // Though mediasoupDevice.loaded in the useEffect condition covers deviceRef.current being ready.
     if (!socket || !deviceRef.current || !recvTransport || !deviceRef.current.loaded) {
-      console.error('CRITICAL: consumeRemoteProducer called when prerequisites were not ready. This should not happen with the new useEffect structure.', {
-        socketReady: !!socket,
-        deviceReady: !!deviceRef.current,
-        recvTransportReady: !!recvTransport,
-        deviceLoaded: deviceRef.current?.loaded,
-      });
-      return;
+        console.error('CRITICAL: consumeRemoteProducer called when prerequisites were not ready.', {
+            socketReady: !!socket,
+            deviceReady: !!deviceRef.current,
+            recvTransportReady: !!recvTransport,
+            deviceLoaded: deviceRef.current?.loaded,
+        });
+        return;
     }
 
     let alreadyConsuming = false;
     consumersMap.forEach(cEntry => {
-      if (cEntry.consumer.producerId === producerId && cEntry.peerId === peerId) {
-        alreadyConsuming = true;
-      }
+        if (cEntry.consumer.producerId === producerId && cEntry.peerId === peerId) {
+            alreadyConsuming = true;
+        }
     });
     if (alreadyConsuming) {
-      console.log(`Already consuming producer ${producerId} from peer ${peerId}`);
-      return;
+        console.log(`Already consuming producer ${producerId} from peer ${peerId}`);
+        return;
     }
 
     console.log(`Attempting to consume producer ${producerId} from peer ${peerId} using transport ${recvTransport.id}`);
     socket.emit('consume', {
-      producerId,
-      rtpCapabilities: deviceRef.current.rtpCapabilities,
-      transportId: recvTransport.id,
+        producerId,
+        rtpCapabilities: deviceRef.current.rtpCapabilities,
+        transportId: recvTransport.id,
     }, async ({ id, kind, rtpParameters, error }: any) => {
-      // ... (rest of the consumeRemoteProducer logic remains the same)
-      if (error) {
-        console.error(`Error consuming producer ${producerId}:`, error);
-        return;
-      }
-      if (!id) {
-        console.error(`Server did not return consumer id for producer ${producerId}`);
-        return;
-      }
-
-      console.log(`Consumer created on server. Client side consumer id: ${id}, kind: ${kind}`);
-      try {
-        const consumer = await recvTransport.consume({
-          id,
-          producerId,
-          kind,
-          rtpParameters,
-        });
-        console.log(`Client-side consumer created for producer ${producerId}, track kind: ${consumer.track.kind}`);
-        
-        setConsumersMap(prev => new Map(prev).set(consumer.id, { consumer, peerId }));
-
-        const { track } = consumer;
-        let currentStream = remoteStreams.get(peerId);
-        if (!currentStream) {
-          currentStream = new MediaStream();
-          setRemoteStreams(prev => new Map(prev).set(peerId, currentStream!));
+        if (error) {
+            console.error(`Error consuming producer ${producerId}:`, error);
+            return;
         }
-        currentStream.addTrack(track);
+        if (!id) {
+            console.error(`Server did not return consumer id for producer ${producerId}`);
+            return;
+        }
 
-        socket.emit('resume-consumer', { consumerId: consumer.id }, (resumeErrorObj?: {error: string}) => {
-          if (resumeErrorObj?.error) {
-            console.error(`Error resuming consumer ${consumer.id} on server:`, resumeErrorObj.error);
-          } else {
-            console.log(`Consumer ${consumer.id} resumed on server.`);
-          }
-        });
+        console.log(`Consumer created on server. Client side consumer id: ${id}, kind: ${kind}`);
+        try {
+            const consumer = await recvTransport.consume({
+                id,
+                producerId,
+                kind,
+                rtpParameters,
+            });
+            console.log(`Client-side consumer created for producer ${producerId}, track kind: ${consumer.track.kind}`);
+            
+            setConsumersMap(prev => new Map(prev).set(consumer.id, { consumer, peerId }));
 
-        consumer.on('trackended', () => {
-          console.log(`Remote track ended for consumer ${consumer.id} (peer ${peerId})`);
-          consumer.close(); 
-          const updatedConsumers = new Map(consumersMap);
-          updatedConsumers.delete(consumer.id);
-          setConsumersMap(updatedConsumers);
-
-          const stream = remoteStreams.get(peerId);
-          if (stream) {
-            stream.removeTrack(track);
-            if (stream.getTracks().length === 0) {
-              const updatedStreams = new Map(remoteStreams);
-              updatedStreams.delete(peerId);
-              setRemoteStreams(updatedStreams);
-              console.log(`Removed video element for peer ${peerId} as all tracks ended.`);
+            const { track } = consumer;
+            let currentStream = remoteStreams.get(peerId);
+            if (!currentStream) {
+                currentStream = new MediaStream();
+                setRemoteStreams(prev => {
+                    const updated = new Map(prev);
+                    updated.set(peerId, currentStream!);
+                    return updated;
+                });
             }
-          }
-        });
-        consumer.on('transportclose', () => { /* ... */ });
-      } catch (consumeError) {
-        console.error(`Error creating client-side consumer for producer ${producerId}:`, consumeError);
-      }
+            if (!currentStream.getTrackById(track.id)) {
+                currentStream.addTrack(track);
+                console.log(`Added track ${track.id} to stream for peer ${peerId}`);
+            }
+
+            socket.emit('resume-consumer', { consumerId: consumer.id }, (resumeErrorObj?: {error: string}) => {
+                if (resumeErrorObj?.error) {
+                    console.error(`Error resuming consumer ${consumer.id} on server:`, resumeErrorObj.error);
+                    consumer.close();
+                    setConsumersMap(prev => {
+                        const updated = new Map(prev);
+                        updated.delete(consumer.id);
+                        return updated;
+                    });
+                } else {
+                    console.log(`Consumer ${consumer.id} resumed on server for peer ${peerId}.`);
+                }
+            });
+
+            consumer.on('trackended', () => {
+                console.log(`Remote track ended for consumer ${consumer.id} (peer ${peerId})`);
+                const updatedConsumers = new Map(consumersMap);
+                updatedConsumers.delete(consumer.id);
+                setConsumersMap(updatedConsumers);
+
+                let peerHasOtherConsumers = false;
+                updatedConsumers.forEach(c => {
+                    if (c.peerId === peerId) peerHasOtherConsumers = true;
+                });
+
+                if (!peerHasOtherConsumers) {
+                    const updatedStreams = new Map(remoteStreams);
+                    updatedStreams.delete(peerId);
+                    setRemoteStreams(updatedStreams);
+                    console.log(`Removed video element for peer ${peerId} as all tracks ended.`);
+                }
+            });
+
+            consumer.on('transportclose', () => {
+                console.log(`Transport closed for consumer ${consumer.id} (peer ${peerId})`);
+                const updatedConsumers = new Map(consumersMap);
+                updatedConsumers.delete(consumer.id);
+                setConsumersMap(updatedConsumers);
+
+                let peerHasOtherConsumers = false;
+                updatedConsumers.forEach(c => {
+                    if (c.peerId === peerId) peerHasOtherConsumers = true;
+                });
+
+                if (!peerHasOtherConsumers) {
+                    const updatedStreams = new Map(remoteStreams);
+                    updatedStreams.delete(peerId);
+                    setRemoteStreams(updatedStreams);
+                    console.log(`Removed video element for peer ${peerId} due to transport close.`);
+                }
+            });
+        } catch (consumeError) {
+            console.error(`Error creating client-side consumer for producer ${producerId}:`, consumeError);
+        }
     });
-  };
+};
   // ... (rest of the component, including JSX return) ...
   return (
     <div className="p-4">
@@ -430,29 +457,27 @@ export default function StreamPage() {
         <div className="bg-gray-800 p-4 rounded-lg shadow-xl">
           <h2 className="text-xl font-semibold mb-3 text-green-400">Remote Videos</h2>
           <div ref={remoteVideoContainerRef} id="remote-videos-container" className="space-y-4">
-            {Array.from(consumersMap.entries())
-              .filter(([consumerId, consumerEntry]) => consumerEntry.consumer.kind === 'video') // Only render video consumers
-              .map(([consumerId, consumerEntry]) => (
-                <div key={consumerId} className="bg-gray-700 p-2 rounded">
-                  <p className="text-sm text-gray-300 mb-1">Remote Peer: {consumerEntry.peerId.substring(0, 6)}...</p>
-                  <video
-                    autoPlay
-                    playsInline
-                    className="w-full h-auto bg-black rounded aspect-video"
-                    ref={(videoElement) => {
-                      if (videoElement && consumerEntry.consumer.track) {
-                        // Set the srcObject directly to the consumer's track
-                        const remoteStream = new MediaStream([consumerEntry.consumer.track]);
-                        videoElement.srcObject = remoteStream;
-                      }
-                    }}
-                  ></video>
-                </div>
-              ))}
-            {consumersMap.size === 0 && (
-              <p className="text-gray-500">No remote streams yet...</p>
-            )}
-          </div>
+          {Array.from(remoteStreams.entries()).map(([peerId, stream]) => (
+            <div key={peerId} className="bg-gray-700 p-2 rounded">
+              <p className="text-sm text-gray-300 mb-1">Remote Peer: {peerId.substring(0, 6)}...</p>
+              <video
+                autoPlay
+                playsInline
+                muted
+                className="w-full h-auto bg-black rounded aspect-video"
+                ref={(videoElement) => {
+                  if (videoElement && stream && videoElement.srcObject !== stream) {
+                    videoElement.srcObject = stream;
+                    console.log(`Set video srcObject for peer ${peerId}`);
+                  }
+                }}
+              ></video>
+            </div>
+          ))}
+  {remoteStreams.size === 0 && (
+    <p className="text-gray-500">No remote streams yet...</p>
+  )}
+</div>
         </div>
       </div>
       <div className="mt-8 p-4 bg-gray-800 rounded-lg shadow-xl">

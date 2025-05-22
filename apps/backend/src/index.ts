@@ -1,4 +1,3 @@
-// apps/backend/src/index.ts
 import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
 import { Server as SocketIOServer, Socket } from 'socket.io';
@@ -7,6 +6,14 @@ import * as mediasoup from 'mediasoup';
 import { types as mediasoupTypes } from 'mediasoup';
 import { config as mediasoupAppConfig } from './mediasoup.config';
 import { logger } from 'hono/logger';
+import { Worker } from 'worker_threads';
+import { Readable, Writable } from 'stream'; // Import Writable for type check if needed
+import { exec, spawn } from 'child_process'; 
+import { promisify } from 'util';
+import fs from 'fs';
+import path from 'path';
+
+const execPromise = promisify(exec);
 
 // --- Mediasoup Globals encapsulated in a class ---
 class MediasoupController {
@@ -16,6 +23,7 @@ class MediasoupController {
     private producers = new Map<string, mediasoupTypes.Producer>();
     private consumers = new Map<string, mediasoupTypes.Consumer>();
     private peerState = new Map<string, { producers: string[], consumers: string[] }>();
+    private hlsStreamId: string | null = null;
 
     constructor() {}
 
@@ -50,7 +58,6 @@ class MediasoupController {
         if (!this.router) {
             throw new Error('Router not initialized');
         }
-        // Ensure listenIps is mutable for Mediasoup
         const listenIps = mediasoupAppConfig.mediasoup.webRtcTransport.listenIps.map(ip => ({ ...ip }));
 
         const transport = await this.router.createWebRtcTransport({
@@ -109,12 +116,20 @@ class MediasoupController {
         }
         console.log(`[${socketId}] Producer created: ${producer.id} (kind: ${kind})`);
 
+        if (kind === 'video' && !this.hlsStreamId) {
+            this.hlsStreamId = producer.id;
+            await this.startHlsConversion(producer.id, socketId);
+        }
+
         producer.on('transportclose', () => {
             console.log(`[${socketId}] Producer ${producer.id} transport closed`);
             producer.close();
             this.producers.delete(producer.id);
             const peerProds = this.peerState.get(socketId)?.producers;
             if (peerProds) this.peerState.get(socketId)!.producers = peerProds.filter(pId => pId !== producer.id);
+            if (this.hlsStreamId === producer.id) {
+                this.hlsStreamId = null;
+            }
         });
         return producer;
     }
@@ -205,6 +220,72 @@ class MediasoupController {
         }
         this.peerState.delete(socketId);
     }
+
+    private async startHlsConversion(producerId: string, socketId: string) {
+        const outputDir = path.join(__dirname, '../public/hls');
+        const outputPath = path.join(outputDir, 'stream.m3u8');
+    
+        if (!fs.existsSync(outputDir)) {
+            fs.mkdirSync(outputDir, { recursive: true });
+        }
+    
+        const hlsTransport = await this.createWebRtcTransport(socketId, false);
+        await this.connectWebRtcTransport(socketId, hlsTransport.id, hlsTransport.dtlsParameters);
+        console.log(`HLS transport connected: ${hlsTransport.id}`);
+    
+        const consumer = await this.consume(socketId, producerId, this.router.rtpCapabilities, hlsTransport.id);
+        await this.resumeConsumer(socketId, consumer.id);
+        console.log(`HLS consumer created for producer ${producerId}`);
+    
+        const rtpStream = new Readable({
+            read() {}
+        });
+    
+        consumer.on('rtp', (rtpPacket: any) => {
+            if (rtpPacket.payload) {
+                rtpStream.push(rtpPacket.payload);
+                console.log(`Pushed RTP packet ${rtpPacket.payload.length} bytes for HLS conversion`);
+            }
+        });
+    
+        consumer.on('producerclose', () => {
+            console.log(`Producer ${producerId} closed, stopping HLS conversion`);
+            rtpStream.push(null);
+        });
+    
+        consumer.on('transportclose', () => {
+            console.log(`Transport closed for HLS consumer, stopping HLS conversion`);
+            rtpStream.push(null);
+        });
+    
+        const ffmpegCommand = `ffmpeg -re -i pipe:0 -c:v libx264 -preset veryfast -f hls -hls_time 4 -hls_list_size 3 -hls_flags delete_segments -hls_segment_filename "${outputDir}/stream_%03d.ts" ${outputPath}`;
+        // const ffmpeg = exec(ffmpegCommand, { stdio: ['pipe', 'pipe', 'pipe'] });
+        const ffmpegExecutable = 'ffmpeg';
+        const ffmpegArgs = [
+            '-re',
+            '-i', 'pipe:0',
+            '-c:v', 'libx264',
+            '-preset', 'veryfast',
+            '-f', 'hls',
+            '-hls_time', '4',
+            '-hls_list_size', '3',
+            '-hls_flags', 'delete_segments',
+            '-hls_segment_filename', `${outputDir}/stream_%03d.ts`,
+            outputPath
+        ];
+        const ffmpeg = spawn(ffmpegExecutable, ffmpegArgs, { stdio: ['pipe', 'pipe', 'pipe'] });
+
+        if (ffmpeg.stdin) {
+            rtpStream.pipe(ffmpeg.stdin);
+            console.log(`Piping RTP stream to FFmpeg for HLS conversion`);
+        } else {
+            console.error('FFmpeg process did not provide a writable stdin stream');
+        }
+    
+        ffmpeg.on('error', (err) => console.error('FFmpeg error:', err.message));
+        ffmpeg.on('close', (code) => console.log(`FFmpeg process exited with code ${code}`));
+        ffmpeg.stderr?.on('data', (data) => console.log(`FFmpeg stderr: ${data}`));
+    }
 }
 
 // --- Socket.IO Signaling Handler Class ---
@@ -221,7 +302,6 @@ class SocketHandler {
     private setupSocketEvents() {
         this.io.on('connection', (socket: Socket) => {
             console.log(`Socket connected: ${socket.id}`);
-            // peerState initialization is now done in MediasoupController when a producer/consumer is added
 
             socket.on('disconnect', () => {
                 console.log(`Socket disconnected: ${socket.id}`);
@@ -280,10 +360,9 @@ class SocketHandler {
                 console.log(`[${socket.id}] consume (producerId: ${producerId}, transportId: ${transportId})`);
                 try {
                     const consumer = await this.mediasoupController.consume(socket.id, producerId, rtpCapabilities, transportId);
-                    // Add producerClose listener here as it needs to emit to the specific socket
                     consumer.on('producerclose', () => {
                         console.log(`[${socket.id}] Consumer ${consumer.id} producer closed`);
-                        socket.emit('consumer-closed', { consumerId: consumer.id, remotePeerId: consumer.appData.producerId }); // Assuming producerId is stored in appData
+                        socket.emit('consumer-closed', { consumerId: consumer.id, remotePeerId: consumer.appData.producerId });
                     });
                     callback({
                         id: consumer.id,
@@ -341,6 +420,17 @@ class SignalingServer {
     private setupHono() {
         this.honoApp.use('*', logger());
         this.honoApp.get('/', (c) => c.json({ message: 'Hono signaling server running!' }));
+        this.honoApp.get('/hls/*', async (c) => {
+            const filePath = path.join(__dirname, '../public/hls', c.req.path.replace('/hls/', ''));
+            if (fs.existsSync(filePath)) {
+                const stat = fs.statSync(filePath);
+                c.header('Content-Type', filePath.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/MP2T');
+                c.header('Content-Length', stat.size.toString());
+                return c.body(fs.createReadStream(filePath) as any);
+            }
+            c.status(404);
+            return c.json({ error: 'File not found' });
+        });
     }
 
     public async start() {
@@ -349,10 +439,9 @@ class SignalingServer {
         serve({
             fetch: this.honoApp.fetch,
             port: this.port,
-            createServer: () => this.httpServer // Use createServer to pass the existing http.Server
+            createServer: () => this.httpServer
         });
 
-        // Ensure the HTTP server is listening
         if (!this.httpServer.listening) {
             this.httpServer.listen(this.port, () => {
                 console.log(`Backend server with Hono & Socket.IO is running on http://localhost:${this.port}`);
