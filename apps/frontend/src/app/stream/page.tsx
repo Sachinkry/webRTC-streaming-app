@@ -259,6 +259,8 @@ export default function StreamPage() {
     });
   };
 
+  // Inside apps/frontend/src/app/stream/page.tsx
+
   const createRecvTransport = async (currentActiveSocket: Socket, device: Device) => {
     if (!currentActiveSocket || !device || !device.loaded) {
       console.error('Cannot create recv transport: prerequisites not ready', {
@@ -276,10 +278,39 @@ export default function StreamPage() {
       }
       console.log('Recv transport created on server:', params.id);
       const transport = device.createRecvTransport(params);
-      setRecvTransport(transport); // Set state to trigger dependent useEffect
+      // setRecvTransport(transport); // Set state AFTER event listeners are attached
 
-      transport.on('connect', ({ dtlsParameters }, callback, errback) => { /* ... */ });
-      transport.on('connectionstatechange', (state) => { /* ... */ });
+      transport.on('connect', async ({ dtlsParameters }, callback, errback) => {
+        console.log(`[RecvTransport ${transport.id}] 'connect' event fired. Attempting to connect on server.`);
+        // Use currentActiveSocket passed to this function, or ensure 'socket' state is used if preferred
+        if (!currentActiveSocket) {
+            console.error('Socket not available for recvTransport connect.');
+            errback(new Error('Socket not available for recvTransport connect'));
+            return;
+        }
+        try {
+          currentActiveSocket.emit('connectWebRtcTransport', {
+            transportId: transport.id,
+            dtlsParameters,
+          }, () => { // Server callback for connectWebRtcTransport
+            console.log(`[RecvTransport ${transport.id}] Server acknowledged connectWebRtcTransport.`);
+            callback(); // Signal success to mediasoup-client transport.connect()
+          });
+        } catch (error: any) {
+          console.error(`[RecvTransport ${transport.id}] Error emitting connectWebRtcTransport:`, error);
+          errback(error instanceof Error ? error : new Error(String(error)));
+        }
+      });
+
+      transport.on('connectionstatechange', (state) => {
+        console.log(`Recv transport ${transport.id} connection state: ${state}`);
+        if (state === 'failed' || state === 'closed' || state === 'disconnected') {
+          console.warn(`Recv transport ${transport.id} entered state: ${state}.`);
+          // Optionally, close the transport or handle related consumer cleanup.
+        }
+      });
+
+      setRecvTransport(transport); // Now set state, this might trigger useEffects dependent on recvTransport
     });
   };
 
@@ -367,6 +398,30 @@ export default function StreamPage() {
             
             setConsumersMap(prev => new Map(prev).set(consumer.id, { consumer, peerId }));
 
+            // Await consumer resume before adding the track
+            try {
+                await new Promise<void>((resolve, reject) => {
+                    socket.emit('resume-consumer', { consumerId: consumer.id }, (resumeErrorObj?: {error: string}) => {
+                        if (resumeErrorObj?.error) {
+                            reject(new Error(`Error resuming consumer ${consumer.id} on server: ${resumeErrorObj.error}`));
+                        } else {
+                            console.log(`Consumer ${consumer.id} resumed on server for peer ${peerId}.`);
+                            resolve();
+                        }
+                    });
+                });
+            } catch (resumeError: any) {
+                console.error(`[Consumer Setup Error] Failed to resume consumer ${consumer.id}:`, resumeError);
+                consumer.close();
+                setConsumersMap(prev => {
+                    const updated = new Map(prev);
+                    updated.delete(consumer.id);
+                    return updated;
+                });
+                // Do not add track or set stream if resume failed
+                return;
+            }
+
             const { track } = consumer;
             let currentStream = remoteStreams.get(peerId);
             if (!currentStream) {
@@ -381,20 +436,6 @@ export default function StreamPage() {
                 currentStream.addTrack(track);
                 console.log(`Added track ${track.id} to stream for peer ${peerId}`);
             }
-
-            socket.emit('resume-consumer', { consumerId: consumer.id }, (resumeErrorObj?: {error: string}) => {
-                if (resumeErrorObj?.error) {
-                    console.error(`Error resuming consumer ${consumer.id} on server:`, resumeErrorObj.error);
-                    consumer.close();
-                    setConsumersMap(prev => {
-                        const updated = new Map(prev);
-                        updated.delete(consumer.id);
-                        return updated;
-                    });
-                } else {
-                    console.log(`Consumer ${consumer.id} resumed on server for peer ${peerId}.`);
-                }
-            });
 
             consumer.on('trackended', () => {
                 console.log(`Remote track ended for consumer ${consumer.id} (peer ${peerId})`);
@@ -433,6 +474,7 @@ export default function StreamPage() {
                     console.log(`Removed video element for peer ${peerId} due to transport close.`);
                 }
             });
+
         } catch (consumeError) {
             console.error(`Error creating client-side consumer for producer ${producerId}:`, consumeError);
         }
@@ -452,6 +494,18 @@ export default function StreamPage() {
             muted
             className="w-full h-auto bg-black rounded aspect-video"
           ></video>
+          {socket?.id && (
+            <div className="mt-4">
+              <a
+                href={`/watch?id=${socket.id}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="bg-green-500 hover:bg-green-700 text-white font-bold py-2 px-4 rounded inline-block"
+              >
+                Open HLS Stream
+              </a>
+            </div>
+          )}
         </div>
         
         <div className="bg-gray-800 p-4 rounded-lg shadow-xl">

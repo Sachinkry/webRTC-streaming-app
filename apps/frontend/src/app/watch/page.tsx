@@ -3,30 +3,58 @@
 import React, { useEffect, useRef, useState } from 'react';
 import Hls, { Events, ErrorTypes, ErrorData } from 'hls.js';
 
-const HLS_STREAM_URL = 'http://localhost:3001/hls/stream.m3u8';
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:3001';
 
 export default function WatchPage() {
     const videoRef = useRef<HTMLVideoElement>(null);
     const [errorMessage, setErrorMessage] = useState<string | null>(null);
+    const [streamId, setStreamId] = useState<string | null>(null);
 
     useEffect(() => {
         const video = videoRef.current;
         if (!video) return;
 
+        // Get the stream ID from the URL
+        const urlParams = new URLSearchParams(window.location.search);
+        const id = urlParams.get('id');
+        if (!id) {
+            setErrorMessage('No stream ID provided. Please go to the stream page first.');
+            return;
+        }
+        setStreamId(id);
+
         if (Hls.isSupported()) {
-            const hls = new Hls();
-            hls.loadSource(HLS_STREAM_URL);
+            const hls = new Hls({
+                debug: true,
+                enableWorker: true,
+                lowLatencyMode: true,
+                backBufferLength: 0
+            });
+
+            const streamUrl = `${BACKEND_URL}/hls/${id}/stream.m3u8`;
+            console.log('Loading HLS stream from:', streamUrl);
+            
+            hls.loadSource(streamUrl);
             hls.attachMedia(video);
+            
             hls.on(Hls.Events.MANIFEST_PARSED, () => {
                 console.log('HLS manifest parsed, starting playback');
-                video.play().catch(err => console.error('Playback failed:', err));
+                video.play().catch(err => {
+                    console.error('Playback failed:', err);
+                    setErrorMessage('Failed to start playback. Please try refreshing the page.');
+                });
             });
+
             hls.on(Events.ERROR, (eventName: Events.ERROR, data: ErrorData) => {
                 console.error('HLS Error:', data.type, data.details);
                 if (data.fatal) {
                     switch (data.type) {
                         case ErrorTypes.NETWORK_ERROR:
-                            setErrorMessage('Network error: Failed to load HLS stream. Ensure a stream is active on the /stream page.');
+                            if (data.details === 'manifestLoadTimeOut') {
+                                setErrorMessage('Stream not found or not yet available. Please ensure someone is streaming.');
+                            } else {
+                                setErrorMessage('Network error: Failed to load HLS stream. Please check your connection.');
+                            }
                             break;
                         case ErrorTypes.MEDIA_ERROR:
                             setErrorMessage('Media error: Incompatible stream format.');
@@ -37,11 +65,20 @@ export default function WatchPage() {
                     hls.destroy();
                 }
             });
-            return () => hls.destroy();
+
+            return () => {
+                console.log('Cleaning up HLS instance');
+                hls.destroy();
+            };
         } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-            video.src = HLS_STREAM_URL;
+            // For Safari
+            const streamUrl = `${BACKEND_URL}/hls/${id}/stream.m3u8`;
+            video.src = streamUrl;
             video.addEventListener('loadedmetadata', () => {
-                video.play().catch(err => console.error('Playback failed:', err));
+                video.play().catch(err => {
+                    console.error('Playback failed:', err);
+                    setErrorMessage('Failed to start playback. Please try refreshing the page.');
+                });
             });
         } else {
             setErrorMessage('HLS is not supported on this browser.');
@@ -52,7 +89,14 @@ export default function WatchPage() {
         <div className="p-4">
             <h1 className="text-3xl font-bold mb-6">Watch Live Stream</h1>
             {errorMessage && (
-                <p className="text-red-500 mb-4">{errorMessage}</p>
+                <div className="bg-red-500 text-white p-4 rounded-lg mb-4">
+                    <p>{errorMessage}</p>
+                    {errorMessage.includes('not found') && (
+                        <a href="/stream" className="text-white underline mt-2 inline-block">
+                            Go to Stream Page
+                        </a>
+                    )}
+                </div>
             )}
             <div className="bg-black rounded-lg shadow overflow-hidden">
                 <video
